@@ -14,6 +14,8 @@
 - [Как подготовить русский датасет для LLM](#как-подготовить-русский-датасет-для-llm)
 - [Как проверить качество модели](#как-проверить-качество-модели)
 - [Ошибки обучения и диагностика](#ошибки-обучения-и-диагностика)
+- [Проверка датасета перед обучением](#проверка-датасета-перед-обучением)
+- [Как локализовать поломку обучения](#как-локализовать-поломку-обучения)
 - [Продвинутые эксперименты с MiniMind](#продвинутые-эксперименты-с-minimind)
 - [Итоговый проект](#итоговый-проект)
 
@@ -219,6 +221,118 @@ flowchart TD
 | `NaN` в SFT | Посмотрите, есть ли в батче целевые позиции после усечения. Проверьте строки JSONL, точность и learning rate. |
 | Модель повторяет вопрос или немедленно останавливается | Сверьте chat template, EOS, длину диалогов, маску и чекпойнт, который загрузила генерация. |
 | Train loss падает, validation loss растёт | Проверьте дубли, размер корпуса и качество сплита. Сравните более ранний чекпойнт. |
+
+## Проверка датасета перед обучением
+
+JSONL может успешно загрузиться даже при утечке между выборками. Например, одна и та же инструкция может попасть в train с одним ответом и в validation с другим. В этом случае проверять совпадение полной строки недостаточно.
+
+Ниже проверка для обычных текстов и диалогов с ролями `system`, `user`, `assistant`. Сохраните блок как `audit_data.py` в корне MiniMind. Скрипт проверяет обе выборки, сравнивает тексты или первые пользовательские инструкции и показывает первую найденную проблему с номером строки.
+
+```python
+import argparse
+import hashlib
+import json
+import unicodedata
+from pathlib import Path
+
+
+def fingerprint(text):
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    normalized = " ".join(normalized.split())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def text_value(value):
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("ожидается непустой текст")
+    return value
+
+
+def row_key(row, stage):
+    if not isinstance(row, dict):
+        raise ValueError("ожидается JSON-объект")
+    if stage == "pretrain":
+        return fingerprint(text_value(row.get("text")))
+    messages = row.get("conversations")
+    if not isinstance(messages, list) or not messages:
+        raise ValueError("ожидается непустой список conversations")
+
+    next_role = "user"
+    first_user = None
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise ValueError("каждая реплика должна быть объектом")
+        role = message.get("role")
+        content = text_value(message.get("content"))
+        if index == 0 and role == "system":
+            continue
+        if role != next_role:
+            raise ValueError(f"ожидается роль {next_role}, получено {role!r}")
+        if role == "user" and first_user is None:
+            first_user = content
+        next_role = "assistant" if role == "user" else "user"
+    if first_user is None or next_role != "user":
+        raise ValueError("диалог должен содержать вопрос и завершаться ответом")
+    return fingerprint(first_user)
+
+
+def scan(path, stage):
+    index = {}
+    duplicates = 0
+    with path.open(encoding="utf-8") as file:
+        for line_number, line in enumerate(file, 1):
+            try:
+                key = row_key(json.loads(line), stage)
+            except ValueError as error:
+                raise SystemExit(f"{path}:{line_number}: {error}") from error
+            if key in index:
+                duplicates += 1
+            else:
+                index[key] = line_number
+    if not index:
+        raise SystemExit(f"{path}: пустая выборка")
+    print(f"{path}: unique={len(index)} repeated={duplicates}")
+    return index
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument("stage", choices=("pretrain", "sft"))
+parser.add_argument("train", type=Path)
+parser.add_argument("valid", type=Path)
+args = parser.parse_args()
+
+train = scan(args.train, args.stage)
+valid = scan(args.valid, args.stage)
+overlap = train.keys() & valid.keys()
+if overlap:
+    first = min(overlap, key=valid.__getitem__)
+    raise SystemExit(
+        f"Совпадений: {len(overlap)}. "
+        f"Первая пара: {args.train}:{train[first]} и {args.valid}:{valid[first]}"
+    )
+print("Точных совпадений после нормализации нет")
+```
+
+```bash
+python audit_data.py pretrain dataset/ru_pretrain.jsonl dataset/ru_valid.jsonl
+python audit_data.py sft dataset/ru_sft.jsonl dataset/ru_sft_valid.jsonl
+```
+
+Для документов, разбитых на фрагменты, заранее группируйте строки по ID исходного документа. Проверка выше находит равенство после нормализации. Для парафразов и частичных пересечений нужен отдельный поиск по шинглам или ручная проверка похожих кластеров. Для наборов с tool calls нужна схема, допускающая дополнительные роли и поля.
+
+## Как локализовать поломку обучения
+
+Перед большим запуском выберите 8–16 коротких примеров. Сохраните копию датасета и прогоните несколько эпох на том же наборе. Для диагностики запишите начальный и конечный loss и сравните генерацию на одном обучающем вопросе. Падение loss здесь показывает, что цепочка от токенизации до шага оптимизатора работает на этих примерах. Для оценки обобщения используйте независимую выборку.
+
+| Наблюдение | Что проверить | Какой вывод искать |
+| --- | --- | --- |
+| Loss почти плоский с первого шага | Посчитайте целевые токены, проверьте `requires_grad` и сравните один обучаемый тензор до и после шага | Меняются ли заявленные параметры |
+| После SFT loss падает, бот копирует реплику пользователя | Декодируйте позиции `labels[1:] != -100` и сравните шаблон обучения с генерацией | Получает ли loss только ожидаемый текст ассистента |
+| Скрипт работает на коротких примерах и падает на реальных | Возьмите верхний перцентиль длины, измерьте пиковую память и долю усечённых ответов | Помещается ли реальный батч и сохраняется ли сигнал SFT |
+| После возобновления изменилась кривая обучения | Сверьте имя resume-чекпойнта, число эпох, позиции в датасете и learning rate вокруг перехода | Восстановились ли состояние оптимизатора и расписание |
+| Низкий validation loss, но слабые ответы | Проверьте пересечения и отдельный тест на инструкции с ожидаемым форматом | Отражает ли метрика задачу, которую должна решать модель |
+
+Для проверки возобновления сделайте парный эксперимент. Первый прогон выполните целиком. Во втором остановитесь после сохранения полного checkpoint и возобновите с той же конфигурацией. Сравните номера итераций, learning rate и loss около границы. Совпадение до последнего бита зависит от сохранения генераторов случайных чисел и детерминизма вычислений. Для проверки важнее, что обучение продолжается с ожидаемого шага.
 
 ## Продвинутые эксперименты с MiniMind
 
